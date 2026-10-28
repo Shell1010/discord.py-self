@@ -86,7 +86,7 @@ class Relationship(Hashable):
             Renamed ``nickname`` to :attr:`nick`.
     since: Optional[:class:`datetime.datetime`]
         When the relationship was created.
-        Only available for type :class:`RelationshipType.incoming_request`.
+        Not available for all relationship types.
 
         .. versionadded:: 2.0
     """
@@ -108,7 +108,7 @@ class Relationship(Hashable):
 
         if not getattr(self, 'user', None):
             if 'user' in data:
-                self.user = self._state.store_user(data['user'])  # type: ignore
+                self.user = self._state.store_user(data['user'])
             else:
                 user_id = int(data['id'])
                 self.user = self._state.get_user(user_id) or Object(id=user_id)  # type: ignore # Lying for better developer UX
@@ -157,7 +157,7 @@ class Relationship(Hashable):
 
         .. note::
 
-            This is only reliably provided for type :class:`RelationshipType.friend`.
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
         """
         return try_enum(Status, self.presence.client_status.status)
 
@@ -169,7 +169,7 @@ class Relationship(Hashable):
 
         .. note::
 
-            This is only reliably provided for type :class:`RelationshipType.friend`.
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
         """
         return self.presence.client_status.status
 
@@ -181,7 +181,7 @@ class Relationship(Hashable):
 
         .. note::
 
-            This is only reliably provided for type :class:`RelationshipType.friend`.
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
         """
         return try_enum(Status, self.presence.client_status.mobile or 'offline')
 
@@ -193,7 +193,7 @@ class Relationship(Hashable):
 
         .. note::
 
-            This is only reliably provided for type :class:`RelationshipType.friend`.
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
         """
         return try_enum(Status, self.presence.client_status.desktop or 'offline')
 
@@ -205,9 +205,21 @@ class Relationship(Hashable):
 
         .. note::
 
-            This is only reliably provided for type :class:`RelationshipType.friend`.
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
         """
         return try_enum(Status, self.presence.client_status.web or 'offline')
+
+    @property
+    def embedded_status(self) -> Status:
+        """:class:`Status`: The user's status on an embedded client, if applicable.
+
+        .. versionadded:: 2.1
+
+        .. note::
+
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
+        """
+        return try_enum(Status, self.presence.client_status.embedded or 'offline')
 
     def is_on_mobile(self) -> bool:
         """:class:`bool`: A helper function that determines if a user is active on a mobile device.
@@ -216,20 +228,20 @@ class Relationship(Hashable):
 
         .. note::
 
-            This is only reliably provided for type :class:`RelationshipType.friend`.
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
         """
         return self.presence.client_status.mobile is not None
 
     @property
     def activities(self) -> Tuple[ActivityTypes, ...]:
-        """Tuple[Union[:class:`BaseActivity`, :class:`Spotify`]]: Returns the activities that
+        """Tuple[:class:`BaseActivity`, ...]: Returns the activities that
         the user is currently doing.
 
         .. versionadded:: 2.0
 
         .. note::
 
-            This is only reliably provided for type :class:`RelationshipType.friend`.
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
 
         .. note::
 
@@ -241,14 +253,14 @@ class Relationship(Hashable):
 
     @property
     def activity(self) -> Optional[ActivityTypes]:
-        """Optional[Union[:class:`BaseActivity`, :class:`Spotify`]]: Returns the primary
+        """Optional[:class:`BaseActivity`]: Returns the primary
         activity the user is currently doing. Could be ``None`` if no activity is being done.
 
         .. versionadded:: 2.0
 
         .. note::
 
-            This is only reliably provided for type :class:`RelationshipType.friend`.
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
 
         .. note::
 
@@ -262,6 +274,22 @@ class Relationship(Hashable):
         """
         if self.activities:
             return self.activities[0]
+
+    @property
+    def hidden_activities(self) -> Tuple[ActivityTypes, ...]:
+        """Tuple[:class:`BaseActivity`, ...]: Returns the activities that
+        the user is currently doing but has set as hidden.
+
+        Hidden activities are provided when you are participating in a shared activity with
+        a user that is invisible or has set their activity settings to private.
+
+        .. versionadded:: 2.1
+
+        .. note::
+
+            This is only provided for type :class:`RelationshipType.friend` and :class:`RelationshipType.implicit` relationships.
+        """
+        return self.presence.hidden_activities
 
     async def delete(self) -> None:
         """|coro|
@@ -288,18 +316,29 @@ class Relationship(Hashable):
 
         await self._state.http.remove_relationship(self.user.id, action=action)
 
-    async def accept(self) -> None:
+    async def accept(self, *, confirm_stranger_request: bool = False) -> None:
         """|coro|
 
         Accepts the relationship request. Only applicable for
         type :class:`RelationshipType.incoming_request`.
+
+        Parameters
+        -----------
+        confirm_stranger_request: :class:`bool`
+            Friend requests from users Discord ascertains to be strangers require additional confirmation to accept.
+
+            Without this confirmation, the acceptance will fail, prompting clients to show a warning before retrying.
+
+            .. versionadded:: 2.2
 
         Raises
         -------
         HTTPException
             Accepting the relationship failed.
         """
-        await self._state.http.add_relationship(self.user.id, action=RelationshipAction.accept_request)
+        await self._state.http.add_relationship(
+            self.user.id, action=RelationshipAction.accept_request, confirm_stranger_request=confirm_stranger_request
+        )
 
     async def edit(self, nick: Optional[str] = MISSING) -> None:
         """|coro|

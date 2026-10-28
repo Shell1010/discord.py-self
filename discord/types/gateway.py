@@ -27,20 +27,22 @@ from __future__ import annotations
 from typing import Generic, Dict, List, Literal, Optional, Tuple, TypedDict, TypeVar, Union
 from typing_extensions import NotRequired, Required
 
-from .activity import Activity, BasePresenceUpdate, PartialPresenceUpdate, StatusType
+from .activity import Activity, BasePresenceUpdate, UserPresenceUpdate, PartialPresenceUpdate, StatusType
 from .application import BaseAchievement
 from .audit_log import AuditLogEntry
 from .automod import AutoModerationAction, AutoModerationRuleTriggerType
 from .channel import ChannelType, DMChannel, GroupDMChannel, StageInstance
+from .directory import DirectoryEntry, PartialDirectoryEntry
 from .emoji import Emoji, PartialEmoji
 from .entitlements import Entitlement, GatewayGift
-from .experiment import GuildExperiment, UserExperiment
+from .experiment import ApexExperimentResponse, GuildExperiment, UserExperiment
 from .guild import Guild, SupplementalGuild, UnavailableGuild
 from .integration import BaseIntegration, IntegrationApplication
-from .interactions import Modal
+from .interactions import IFrameModalSize, Modal
 from .invite import _InviteTargetType
 from .library import LibraryApplication
 from .member import MemberWithPresence, MemberWithUser
+from .member_verification import JoinRequest, JoinRequestStatus
 from .message import Message, ReactionType
 from .payments import Payment
 from .read_state import ReadState, ReadStateType
@@ -61,16 +63,12 @@ from .user import (
     User,
     UserGuildSettings,
 )
-from .voice import GuildVoiceState, PrivateVoiceState, VoiceState
+from .voice import GuildVoiceState, PrivateVoiceState, VoiceServerUpdate, VoiceState
 
 T = TypeVar('T')
 
 
-class UserPresenceUpdateEvent(BasePresenceUpdate):
-    ...
-
-
-PresenceUpdateEvent = Union[PartialPresenceUpdate, UserPresenceUpdateEvent]
+PresenceUpdateEvent = Union[PartialPresenceUpdate, UserPresenceUpdate]
 
 
 class Gateway(TypedDict):
@@ -90,6 +88,7 @@ class ReadyEvent(ResumedEvent):
     _trace: List[str]
     api_code_version: int
     analytics_token: str
+    apex_experiments: Optional[ApexExperimentResponse]
     auth_session_id_hash: str
     auth_token: NotRequired[str]
     connected_accounts: List[Connection]
@@ -100,6 +99,7 @@ class ReadyEvent(ResumedEvent):
     geo_ordered_rtc_regions: List[str]
     guild_experiments: List[GuildExperiment]
     guilds: List[Guild]
+    guild_join_requests: List[JoinRequest]
     merged_members: List[List[MemberWithUser]]
     pending_payments: NotRequired[List[Payment]]
     private_channels: List[Union[DMChannel, GroupDMChannel]]
@@ -121,8 +121,8 @@ class ReadyEvent(ResumedEvent):
 
 class ClientInfo(TypedDict):
     version: int
-    os: str
-    client: str
+    os: Literal['windows', 'osx', 'linux', 'android', 'ios', 'playstation', 'unknown']
+    client: Literal['web', 'desktop', 'mobile', 'unknown']
 
 
 class Session(TypedDict):
@@ -131,10 +131,11 @@ class Session(TypedDict):
     client_info: ClientInfo
     status: StatusType
     activities: List[Activity]
+    hidden_activities: List[Activity]
 
 
 class MergedPresences(TypedDict):
-    friends: List[UserPresenceUpdateEvent]
+    friends: List[UserPresenceUpdate]
     guilds: List[List[PartialPresenceUpdate]]
 
 
@@ -178,8 +179,7 @@ class MessageDeleteBulkEvent(TypedDict):
     guild_id: NotRequired[Snowflake]
 
 
-class MessageUpdateEvent(Message):
-    channel_id: Snowflake
+MessageUpdateEvent = MessageCreateEvent
 
 
 class MessageReactionAddEvent(TypedDict):
@@ -253,6 +253,7 @@ ChannelCreateEvent = ChannelUpdateEvent = ChannelDeleteEvent = _ChannelEvent
 class ChannelRecipientEvent(TypedDict):
     channel_id: Snowflake
     user: PartialUser
+    nick: str
 
 
 class ChannelPinsUpdateEvent(TypedDict):
@@ -442,12 +443,35 @@ GuildScheduledEventUserAdd = GuildScheduledEventUserRemove = _GuildScheduledEven
 
 VoiceStateUpdateEvent = Union[GuildVoiceState, PrivateVoiceState]
 
+VoiceServerUpdateEvent = VoiceServerUpdate
 
-class VoiceServerUpdateEvent(TypedDict):
+
+class StreamEvent(TypedDict):
+    stream_key: str
+    region: NotRequired[str]
+    viewer_ids: NotRequired[List[Snowflake]]
+    paused: NotRequired[bool]
+
+
+class StreamCreateEvent(StreamEvent):
+    rtc_server_id: Snowflake
+    rtc_channel_id: Snowflake
+
+
+class StreamServerUpdateEvent(TypedDict):
     token: str
-    guild_id: Snowflake
-    channel_id: Snowflake
+    stream_key: str
     endpoint: Optional[str]
+    guild_id: NotRequired[Optional[Snowflake]]
+
+
+class StreamDeleteEvent(TypedDict):
+    stream_key: str
+    reason: str
+    unavailable: NotRequired[bool]
+
+
+StreamUpdateEvent = StreamEvent
 
 
 class TypingStartEvent(TypedDict):
@@ -569,11 +593,19 @@ class PartialUpdateChannel(TypedDict):
     last_pin_timestamp: NotRequired[Optional[str]]
 
 
-class PassiveUpdateEvent(TypedDict):
+class PassiveUpdateV1Event(TypedDict):
     guild_id: Snowflake
     channels: List[PartialUpdateChannel]
     voice_states: NotRequired[List[VoiceState]]
     members: NotRequired[List[MemberWithUser]]
+
+
+class PassiveUpdateV2Event(TypedDict):
+    guild_id: Snowflake
+    removed_voice_states: List[Snowflake]
+    updated_channels: List[PartialUpdateChannel]
+    updated_members: List[MemberWithUser]
+    updated_voice_states: List[VoiceState]
 
 
 class GuildApplicationCommandIndexUpdateEvent(TypedDict):
@@ -595,6 +627,36 @@ UserGuildSettingsEvent = UserGuildSettings
 class InteractionEvent(TypedDict):
     id: Snowflake
     nonce: NotRequired[Snowflake]
+
+
+class InteractionFailureEvent(InteractionEvent):
+    reason_code: int
+
+
+class ApplicationCommandAutocompleteChoice(TypedDict):
+    name: str
+    value: Union[str, int, float]
+    name_localized: NotRequired[str]
+
+
+class ApplicationCommandAutocompleteEvent(TypedDict):
+    nonce: Snowflake
+    choices: List[ApplicationCommandAutocompleteChoice]
+
+
+class InteractionIframeModalCreateEvent(TypedDict):
+    id: Snowflake
+    channel_id: Snowflake
+    custom_id: str
+    application: IntegrationApplication
+    title: str
+    iframe_path: str
+    modal_size: IFrameModalSize
+    nonce: NotRequired[Snowflake]
+
+
+class InteractionIframeModalCloseEvent(TypedDict):
+    application_id: Snowflake
 
 
 InteractionModalCreateEvent = Modal
@@ -637,7 +699,7 @@ class GuildSubscribePayload(BaseGuildSubscribePayload):
     guild_id: Snowflake
 
 
-BulkGuildSubscribePayload = Dict[Snowflake, BaseGuildSubscribePayload]
+BulkGuildSubscribePayload = Dict[str, BaseGuildSubscribePayload]
 
 
 class _GuildMemberListGroup(TypedDict):
@@ -711,3 +773,26 @@ class PollVoteActionEvent(TypedDict):
     message_id: Snowflake
     guild_id: NotRequired[Snowflake]
     answer_id: int
+
+
+class GuildJoinRequestCreateEvent(TypedDict):
+    guild_id: Snowflake
+    request: JoinRequest
+    status: JoinRequestStatus
+
+
+GuildJoinRequestUpdateEvent = GuildJoinRequestCreateEvent
+
+
+class GuildJoinRequestDeleteEvent(TypedDict):
+    guild_id: Snowflake
+    id: Snowflake
+    user_id: Snowflake
+
+
+class DirectoryEntryEvent(DirectoryEntry):
+    guild_id: Snowflake
+
+
+class DirectoryEntryDeleteEvent(PartialDirectoryEntry):
+    guild_id: Snowflake

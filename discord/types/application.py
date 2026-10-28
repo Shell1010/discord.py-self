@@ -47,7 +47,7 @@ class Secret(TypedDict):
     secret: str
 
 
-class _BaseApplication(TypedDict):
+class BaseApplication(TypedDict):
     id: Snowflake
     name: str
     description: str
@@ -59,26 +59,36 @@ class _BaseApplication(TypedDict):
     summary: NotRequired[Literal['']]
     deeplink_uri: NotRequired[str]
     third_party_skus: NotRequired[List[ThirdPartySKU]]
-
-
-class BaseApplication(_BaseApplication):
     bot: NotRequired[PartialUser]
+    is_verified: bool
+    is_discoverable: bool
+    is_monetized: bool
+    storefront_available: bool
+
+
+class DetectableApplication(TypedDict):
+    id: Snowflake
+    name: str
+    hook: bool
+    overlay: NotRequired[bool]
+    overlay_methods: NotRequired[int]
+    overlay_warn: NotRequired[bool]
+    overlay_compatibility_hook: NotRequired[bool]
+    aliases: NotRequired[List[str]]
+    executables: NotRequired[List[ApplicationExecutable]]
 
 
 class IntegrationApplication(BaseApplication):
     role_connections_verification_url: NotRequired[Optional[str]]
 
 
-class PartialApplication(_BaseApplication):
+class PartialApplication(BaseApplication, DetectableApplication):
     owner: NotRequired[APIUser]  # Not actually ever present in partial app
     team: NotRequired[Team]
     verify_key: str
-    flags: NotRequired[int]
+    flags: int
+    new_flags: NotRequired[str]
     rpc_origins: NotRequired[List[str]]
-    hook: NotRequired[bool]
-    overlay: NotRequired[bool]
-    overlay_warn: NotRequired[bool]
-    overlay_compatibility_hook: NotRequired[bool]
     terms_of_service_url: NotRequired[str]
     privacy_policy_url: NotRequired[str]
     max_participants: NotRequired[Optional[int]]
@@ -91,13 +101,11 @@ class PartialApplication(_BaseApplication):
     slug: NotRequired[str]
     developers: NotRequired[List[Company]]
     publishers: NotRequired[List[Company]]
-    aliases: NotRequired[List[str]]
     eula_id: NotRequired[Snowflake]
     embedded_activity_config: NotRequired[EmbeddedActivityConfig]
     guild: NotRequired[PartialGuild]
     install_params: NotRequired[ApplicationInstallParams]
     store_listing_sku_id: NotRequired[Snowflake]
-    executables: NotRequired[List[ApplicationExecutable]]
 
 
 class ApplicationDiscoverability(TypedDict):
@@ -243,17 +251,26 @@ class Manifest(TypedDict):
     url: Optional[str]
 
 
-class ActivityStatistics(TypedDict):
-    application_id: NotRequired[Snowflake]
-    user_id: NotRequired[Snowflake]
+class _BaseActivityStatistics(TypedDict):
     total_duration: int
-    total_discord_sku_duration: NotRequired[int]
     last_played_at: str
+
+
+class UserActivityStatistics(_BaseActivityStatistics):
+    application_id: Snowflake
+    total_discord_sku_duration: NotRequired[int]
+    first_played_at: Optional[str]
+
+
+class ApplicationActivityStatistics(_BaseActivityStatistics):
+    user_id: Snowflake
 
 
 class GlobalActivityStatistics(TypedDict):
     application_id: Snowflake
+    application: NotRequired[PartialApplication]
     user_id: Snowflake
+    user: NotRequired[PartialUser]
     duration: int
     updated_at: str
 
@@ -322,3 +339,8 @@ class UnverifiedApplication(TypedDict):
     name: str
     hash: str
     missing_data: List[str]
+
+
+class ExternalAsset(TypedDict):
+    url: str
+    external_asset_path: str

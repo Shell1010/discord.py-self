@@ -37,6 +37,7 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    overload,
 )
 
 import aiohttp
@@ -45,7 +46,7 @@ import inspect
 
 from collections.abc import Sequence
 from discord.backoff import ExponentialBackoff
-from discord.utils import MISSING
+from discord.utils import MISSING, _iscoroutinefunction
 
 _log = logging.getLogger(__name__)
 
@@ -111,12 +112,17 @@ class SleepHandle:
         self.loop: asyncio.AbstractEventLoop = loop
         self.future: asyncio.Future[None] = loop.create_future()
         relative_delta = discord.utils.compute_timedelta(dt)
-        self.handle = loop.call_later(relative_delta, self.future.set_result, True)
+        self.handle = loop.call_later(relative_delta, self._wrapped_set_result, self.future)
+
+    @staticmethod
+    def _wrapped_set_result(future: asyncio.Future) -> None:
+        if not future.done():
+            future.set_result(None)
 
     def recalculate(self, dt: datetime.datetime) -> None:
         self.handle.cancel()
         relative_delta = discord.utils.compute_timedelta(dt)
-        self.handle: asyncio.TimerHandle = self.loop.call_later(relative_delta, self.future.set_result, True)
+        self.handle: asyncio.TimerHandle = self.loop.call_later(relative_delta, self._wrapped_set_result, self.future)
 
     def wait(self) -> asyncio.Future[Any]:
         return self.future
@@ -171,12 +177,12 @@ class Loop(Generic[LF]):
         if self.count is not None and self.count <= 0:
             raise ValueError('count must be greater than 0 or None.')
 
-        self.change_interval(seconds=seconds, minutes=minutes, hours=hours, time=time)
+        self.change_interval(seconds=seconds, minutes=minutes, hours=hours, time=time)  # type: ignore
         self._last_iteration_failed = False
         self._last_iteration: datetime.datetime = MISSING
         self._next_iteration = None
 
-        if not inspect.iscoroutinefunction(self.coro):
+        if not _iscoroutinefunction(self.coro):
             raise TypeError(f'Expected coroutine function, not {type(self.coro).__name__!r}.')
 
     async def _call_loop_function(self, name: str, *args: Any, **kwargs: Any) -> None:
@@ -224,7 +230,7 @@ class Loop(Generic[LF]):
                     # Sometimes asyncio is cheeky and wakes up a few microseconds before our target
                     # time, causing it to repeat a run.
                     while self._is_explicit_time() and self._next_iteration <= self._last_iteration:
-                        _log.warn(
+                        _log.warning(
                             (
                                 'Clock drift detected for task %s. Woke up at %s but needed to sleep until %s. '
                                 'Sleeping until %s again to correct clock'
@@ -244,7 +250,14 @@ class Loop(Generic[LF]):
                     self._last_iteration_failed = True
                     if not self.reconnect:
                         raise
-                    await asyncio.sleep(backoff.delay())
+
+                    retry_after = backoff.delay()
+                    _log.exception(
+                        'Handling exception in internal background task %s. Retrying in %.2fs',
+                        self.coro.__qualname__,
+                        retry_after,
+                    )
+                    await asyncio.sleep(retry_after)
                 else:
                     if self._stop_next_iteration:
                         return
@@ -561,7 +574,7 @@ class Loop(Generic[LF]):
             The function was not a coroutine.
         """
 
-        if not inspect.iscoroutinefunction(coro):
+        if not _iscoroutinefunction(coro):
             raise TypeError(f'Expected coroutine function, received {coro.__class__.__name__!r}.')
 
         self._before_loop = coro
@@ -589,7 +602,7 @@ class Loop(Generic[LF]):
             The function was not a coroutine.
         """
 
-        if not inspect.iscoroutinefunction(coro):
+        if not _iscoroutinefunction(coro):
             raise TypeError(f'Expected coroutine function, received {coro.__class__.__name__!r}.')
 
         self._after_loop = coro
@@ -619,7 +632,7 @@ class Loop(Generic[LF]):
         TypeError
             The function was not a coroutine.
         """
-        if not inspect.iscoroutinefunction(coro):
+        if not _iscoroutinefunction(coro):
             raise TypeError(f'Expected coroutine function, received {coro.__class__.__name__!r}.')
 
         self._error = coro  # type: ignore
@@ -698,6 +711,22 @@ class Loop(Generic[LF]):
         ret = sorted(set(ret))  # de-dupe and sort times
         return ret
 
+    @overload
+    def change_interval(
+        self,
+        *,
+        seconds: float = 0,
+        minutes: float = 0,
+        hours: float = 0,
+    ) -> None: ...
+
+    @overload
+    def change_interval(
+        self,
+        *,
+        time: Union[datetime.time, Sequence[datetime.time]],
+    ) -> None: ...
+
     def change_interval(
         self,
         *,
@@ -763,6 +792,28 @@ class Loop(Generic[LF]):
             if self._handle and not self._handle.done():
                 # the loop is sleeping, recalculate based on new interval
                 self._handle.recalculate(self._next_iteration)
+
+
+@overload
+def loop(
+    *,
+    seconds: float = 0,
+    minutes: float = 0,
+    hours: float = 0,
+    count: Optional[int] = None,
+    reconnect: bool = True,
+    name: Optional[str] = None,
+) -> Callable[[LF], Loop[LF]]: ...
+
+
+@overload
+def loop(
+    *,
+    time: Union[datetime.time, Sequence[datetime.time]],
+    count: Optional[int] = None,
+    reconnect: bool = True,
+    name: Optional[str] = None,
+) -> Callable[[LF], Loop[LF]]: ...
 
 
 def loop(

@@ -24,7 +24,7 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
-from typing import List, Literal, TypedDict
+from typing import List, Literal, Optional, TypedDict
 from typing_extensions import NotRequired
 
 from .billing import PartialPaymentSource
@@ -34,7 +34,6 @@ from .subscriptions import PartialSubscription
 
 
 class PartialPayment(TypedDict):
-    # TODO: There might be more, but I don't have an example payload
     id: Snowflake
     amount: int
     tax: int
@@ -59,3 +58,8 @@ class Payment(PartialPayment):
     sku: NotRequired[PublicSKU]
     payment_source: NotRequired[PartialPaymentSource]
     subscription: NotRequired[PartialSubscription]
+    metadata: PaymentMetadata
+
+
+class PaymentMetadata(TypedDict):
+    billing_error_code: Optional[int]

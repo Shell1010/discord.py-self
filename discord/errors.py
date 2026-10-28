@@ -29,7 +29,8 @@ from typing import TYPE_CHECKING, Any, Dict, Final, List, Optional, Tuple, Union
 from .utils import _get_as_snowflake
 
 if TYPE_CHECKING:
-    from aiohttp import ClientResponse, ClientWebSocketResponse
+    from aiohttp import ClientResponse
+    from curl_cffi.requests import Response as CurlResponse
     from requests import Response
     from typing_extensions import TypeGuard
 
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
         FormErrorWrapper as FormErrorWrapperPayload,
     )
 
-    _ResponseType = Union[ClientResponse, Response]
+    _ResponseType = Union[ClientResponse, CurlResponse, Response]
 
 __all__ = (
     'DiscordException',
@@ -57,6 +58,7 @@ __all__ = (
     'LoginFailure',
     'ConnectionClosed',
     'CaptchaRequired',
+    'FFmpegProcessError',
 )
 
 
@@ -78,6 +80,15 @@ class ClientException(DiscordException):
     __slots__ = ()
 
 
+class FFmpegProcessError(ClientException):
+    """Exception that's raised when an FFmpeg process fails.
+
+    .. versionadded:: 2.2
+    """
+
+    pass
+
+
 class GatewayNotFound(DiscordException):
     """An exception that is raised when the gateway for Discord could not be found"""
 
@@ -94,7 +105,7 @@ def _flatten_error_dict(d: FormErrorsPayload, key: str = '', /) -> Dict[str, str
 
     if is_wrapper(d) and not key:
         items.append(('miscellaneous', ' '.join(x.get('message', '') for x in d['_errors'])))
-        d.pop('_errors')  # type: ignore
+        d.pop('_errors')
 
     for k, v in d.items():
         new_key = key + '.' + k if key else k
@@ -116,10 +127,10 @@ class HTTPException(DiscordException):
 
     Attributes
     ------------
-    response: :class:`aiohttp.ClientResponse`
-        The response of the failed HTTP request. This is an
-        instance of :class:`aiohttp.ClientResponse`. In some cases
-        this could also be a :class:`requests.Response`.
+    response: Union[:class:`curl_cffi.requests.Response`, :class:`aiohttp.ClientResponse`]
+        The response of the failed HTTP request. This is an instance of
+        :class:`curl_cffi.requests.Response` or :class:`aiohttp.ClientResponse`.
+        In some cases this could also be a :class:`requests.Response`.
     text: :class:`str`
         The text of the error. Could be an empty string.
     status: :class:`int`
@@ -159,6 +170,10 @@ class HTTPException(DiscordException):
             self.text = message or ''
             self.json = {'code': 0, 'message': message or ''}
 
+        if self.code == 40333:
+            # Cloudflare access denied
+            self.text = 'Cloudflare access denied (code: 1020)'
+
         fmt = '{0.status} {0.reason} (error code: {1})'
         if len(self.text):
             fmt += ': {2}'
@@ -183,12 +198,17 @@ class RateLimited(DiscordException):
     retry_after: :class:`float`
         The amount of seconds that the client should wait before retrying
         the request.
+    cloudflare: :class:`bool`
+        Whether the rate limit was issued by Cloudflare.
+
+        .. versionadded:: 2.1
     """
 
-    __slots__ = ('retry_after',)
+    __slots__ = ('retry_after', 'cloudflare')
 
-    def __init__(self, retry_after: float):
+    def __init__(self, retry_after: float, *, cloudflare: bool = False):
         self.retry_after = retry_after
+        self.cloudflare = cloudflare
         super().__init__(f'Too many requests. Retry in {retry_after:.2f} seconds.')
 
 
@@ -238,10 +258,8 @@ class CaptchaRequired(HTTPException):
         The CAPTCHA service to use. Usually ``hcaptcha``.
 
         .. versionadded:: 2.1
-    sitekey: :class:`str`
-        The CAPTCHA sitekey to use.
-
-        .. versionadded:: 2.1
+    session_id: Optional[:class:`str`]
+        The CAPTCHA session ID.
     rqdata: Optional[:class:`str`]
         The enterprise hCaptcha request data.
 
@@ -250,20 +268,47 @@ class CaptchaRequired(HTTPException):
         The enterprise hCaptcha request token.
 
         .. versionadded:: 2.1
+    should_serve_invisible: :class:`bool`
+        Whether the CAPTCHA should be invisible.
+
+        .. versionadded:: 2.1
     """
 
-    RECAPTCHA_SITEKEY: Final[str] = '6Lef5iQTAAAAAKeIvIY-DeexoO3gj7ryl9rLMEnn'
+    __slots__ = (
+        'errors',
+        'service',
+        '_sitekey',
+        'session_id',
+        'rqdata',
+        'rqtoken',
+        'should_serve_invisible',
+    )
 
-    __slots__ = ('errors', 'service', 'sitekey')
+    RECAPTCHA_SITEKEY: Final[str] = '6Lef5iQTAAAAAKeIvIY-DeexoO3gj7ryl9rLMEnn'
+    RECAPTCHA_ENTERPRISE_SITEKEY: Final[str] = '6LeYqFcqAAAAAD6iZesmNgVulsO4PkpBdr6NVG6M'
 
     def __init__(self, response: _ResponseType, message: CaptchaPayload):
         super().__init__(response, {'code': -1, 'message': 'Captcha required'})
         self.json: CaptchaPayload = message
         self.errors: List[str] = message['captcha_key']
-        self.service: CaptchaService = message.get('captcha_service', 'hcaptcha')
-        self.sitekey: str = message.get('captcha_sitekey') or self.RECAPTCHA_SITEKEY
+        self.service: CaptchaService = message.get('captcha_service', 'recaptcha')
+        self._sitekey: str | None = message.get('captcha_sitekey')
+        self.session_id: Optional[str] = message.get('captcha_session_id')
         self.rqdata: Optional[str] = message.get('captcha_rqdata')
         self.rqtoken: Optional[str] = message.get('captcha_rqtoken')
+        self.should_serve_invisible: bool = message.get('should_serve_invisible', False)
+
+    @property
+    def sitekey(self) -> str:
+        """:class:`str`: The CAPTCHA sitekey to use.
+
+        .. versionadded:: 2.1
+        """
+        if self._sitekey is not None:
+            return self._sitekey
+        elif self.service == 'recaptcha_enterprise':
+            return self.RECAPTCHA_ENTERPRISE_SITEKEY
+        return self.RECAPTCHA_SITEKEY
 
 
 class InvalidData(ClientException):
@@ -300,10 +345,9 @@ class ConnectionClosed(ClientException):
 
     __slots__ = ('code', 'reason')
 
-    def __init__(self, socket: ClientWebSocketResponse, *, code: Optional[int] = None):
+    def __init__(self, code: Optional[int] = None, reason: Optional[str] = None):
         # This exception is just the same exception except
         # reconfigured to subclass ClientException for users
-        self.code: int = code or socket.close_code or -1
-        # aiohttp doesn't seem to consistently provide close reason
-        self.reason: str = ''
-        super().__init__(f'WebSocket closed with {self.code}')
+        self.code: int = code or -1
+        self.reason: str = reason or 'unknown'
+        super().__init__(f'WebSocket closed with {self.code} (reason: {self.reason!r})')

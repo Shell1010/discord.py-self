@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import asyncio
 from datetime import datetime
+import logging
 from operator import attrgetter
 from typing import (
     Any,
@@ -34,6 +35,7 @@ from typing import (
     Callable,
     Collection,
     Dict,
+    Generator,
     List,
     Literal,
     Optional,
@@ -46,10 +48,11 @@ from typing import (
     overload,
     runtime_checkable,
 )
+import warnings
 
 from .object import OLDEST_OBJECT, Object
 from .context_managers import Typing
-from .enums import ApplicationCommandType, ChannelType, InviteTarget, NetworkConnectionType
+from .enums import ChannelType, InviteTarget, NetworkConnectionType
 from .errors import ClientException
 from .mentions import AllowedMentions
 from .permissions import PermissionOverwrite, Permissions
@@ -60,7 +63,14 @@ from .http import handle_message_parameters
 from .voice_client import VoiceClient, VoiceProtocol
 from .sticker import GuildSticker, StickerItem
 from .settings import ChannelSettings
-from .commands import ApplicationCommand, BaseCommand, SlashCommand, UserCommand, MessageCommand, _command_factory
+from .commands import (
+    ApplicationCommand,
+    MessageCommand,
+    PrimaryEntryPointCommand,
+    SlashCommand,
+    UserCommand,
+    _commands_from_index,
+)
 from .flags import InviteFlags
 from . import utils
 
@@ -75,9 +85,13 @@ __all__ = (
 )
 
 T = TypeVar('T', bound=VoiceProtocol)
+MISSING = utils.MISSING
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from typing_extensions import Self
+    from typing_extensions import Self, Unpack
+
     from .client import Client
     from .user import ClientUser, User
     from .asset import Asset
@@ -96,6 +110,7 @@ if TYPE_CHECKING:
         StageChannel,
         CategoryChannel,
     )
+    from .permissions import flag_value
     from .poll import Poll
     from .threads import Thread
     from .types.channel import (
@@ -106,13 +121,18 @@ if TYPE_CHECKING:
     )
     from .types.embed import EmbedType
     from .types.message import MessageSearchAuthorType, MessageSearchHasType, PartialMessage as PartialMessagePayload
-    from .types.snowflake import (
-        SnowflakeList,
-    )
+    from .types.guild import ChannelPositionUpdate
+    from .types.snowflake import SnowflakeList
+    from .permissions import _PermissionOverwriteKwargs
 
     MessageableChannel = Union[TextChannel, VoiceChannel, StageChannel, Thread, DMChannel, PartialMessageable, GroupChannel]
     VocalChannel = Union[VoiceChannel, StageChannel, DMChannel, GroupChannel]
-    SnowflakeTime = Union["Snowflake", datetime]
+    SnowflakeTime = Union['Snowflake', datetime]
+
+    class PinnedMessage(Message):
+        pinned_at: datetime
+        pinned: Literal[True]
+
 
 MISSING = utils.MISSING
 
@@ -123,6 +143,26 @@ class _Undefined:
 
 
 _undefined: Any = _Undefined()
+
+
+class _PinsIterator:
+    def __init__(self, iterator: AsyncIterator[PinnedMessage]) -> None:
+        self.__iterator: AsyncIterator[PinnedMessage] = iterator
+
+    def __await__(self) -> Generator[Any, None, List[PinnedMessage]]:
+        warnings.warn(
+            '`await <channel>.pins()` is deprecated; use `async for message in <channel>.pins()` instead.',
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        async def gather() -> List[PinnedMessage]:
+            return [msg async for msg in self.__iterator]
+
+        return gather().__await__()
+
+    def __aiter__(self) -> AsyncIterator[PinnedMessage]:
+        return self.__iterator
 
 
 async def _purge_helper(
@@ -152,6 +192,8 @@ async def _purge_helper(
             count = 0
         if not check(message):
             continue
+        if not message.type.is_deletable():
+            continue
 
         count += 1
         ret.append(message)
@@ -160,101 +202,6 @@ async def _purge_helper(
     to_delete = ret[-count:]
     await state._delete_messages(channel_id, to_delete, reason=reason)
     return ret
-
-
-@overload
-def _handle_commands(
-    messageable: Messageable,
-    type: Literal[ApplicationCommandType.chat_input],
-    *,
-    query: Optional[str] = ...,
-    limit: Optional[int] = ...,
-    command_ids: Optional[Collection[int]] = ...,
-    application: Optional[Snowflake] = ...,
-    target: Optional[Snowflake] = ...,
-) -> AsyncIterator[SlashCommand]:
-    ...
-
-
-@overload
-def _handle_commands(
-    messageable: Messageable,
-    type: Literal[ApplicationCommandType.user],
-    *,
-    query: Optional[str] = ...,
-    limit: Optional[int] = ...,
-    command_ids: Optional[Collection[int]] = ...,
-    application: Optional[Snowflake] = ...,
-    target: Optional[Snowflake] = ...,
-) -> AsyncIterator[UserCommand]:
-    ...
-
-
-@overload
-def _handle_commands(
-    messageable: Message,
-    type: Literal[ApplicationCommandType.message],
-    *,
-    query: Optional[str] = ...,
-    limit: Optional[int] = ...,
-    command_ids: Optional[Collection[int]] = ...,
-    application: Optional[Snowflake] = ...,
-    target: Optional[Snowflake] = ...,
-) -> AsyncIterator[MessageCommand]:
-    ...
-
-
-async def _handle_commands(
-    messageable: Union[Messageable, Message],
-    type: Optional[ApplicationCommandType] = None,
-    *,
-    query: Optional[str] = None,
-    limit: Optional[int] = None,
-    command_ids: Optional[Collection[int]] = None,
-    application: Optional[Snowflake] = None,
-    target: Optional[Snowflake] = None,
-) -> AsyncIterator[BaseCommand]:
-    if limit is not None and limit < 0:
-        raise ValueError('limit must be greater than or equal to 0')
-    if query and command_ids:
-        raise TypeError('Cannot specify both query and command_ids')
-
-    channel = await messageable._get_channel()
-    cmd_ids = list(command_ids) if command_ids else None
-
-    application_id = application.id if application else None
-    if channel.type == ChannelType.private:
-        target = channel.recipient  # type: ignore
-    elif channel.type == ChannelType.group:
-        return
-
-    cmds = await channel.application_commands()
-    for cmd in cmds:
-        # Handle faked parameters
-        if type is not None and cmd.type != type:
-            continue
-        if query and query.lower() not in cmd.name:
-            continue
-        if (not cmd_ids or cmd.id not in cmd_ids) and limit == 0:
-            continue
-        if application_id and cmd.application_id != application_id:
-            continue
-        if target:
-            if cmd.type == ApplicationCommandType.user:
-                cmd._user = target
-            elif cmd.type == ApplicationCommandType.message:
-                cmd._message = target  # type: ignore
-
-        # We follow Discord behavior
-        if limit is not None and (not cmd_ids or cmd.id not in cmd_ids):
-            limit -= 1
-
-        try:
-            cmd_ids.remove(cmd.id) if cmd_ids else None
-        except ValueError:
-            pass
-
-        yield cmd
 
 
 async def _handle_message_search(
@@ -266,6 +213,8 @@ async def _handle_message_search(
     after: SnowflakeTime = MISSING,
     include_nsfw: bool = MISSING,
     content: str = MISSING,
+    contents: Sequence[str] = MISSING,
+    slop: int = 0,
     channels: Collection[Snowflake] = MISSING,
     authors: Collection[Snowflake] = MISSING,
     author_types: Collection[MessageSearchAuthorType] = MISSING,
@@ -278,16 +227,26 @@ async def _handle_message_search(
     link_hostnames: Collection[str] = MISSING,
     attachment_filenames: Collection[str] = MISSING,
     attachment_extensions: Collection[str] = MISSING,
-    application_commands: Collection[Snowflake] = MISSING,
-    oldest_first: bool = False,
+    application_command_id: Optional[Snowflake] = MISSING,
+    application_command_name: Optional[str] = MISSING,
+    oldest_first: bool = MISSING,
     most_relevant: bool = False,
 ) -> AsyncIterator[Message]:
+    # Important note for message search:
+    # The endpoint might sometimes time out while waiting for messages
+    # This will manifest as less results than the limit, even if there are more messages to be found
+
     from .channel import PartialMessageable  # circular import
 
     if limit is not None and limit < 0:
         raise ValueError('limit must be greater than or equal to 0')
     if offset < 0:
         raise ValueError('offset must be greater than or equal to 0')
+
+    if application_command_id and not application_command_name:
+        raise TypeError('application_command_name must be specified if application_command_id is specified')
+    if application_command_name and not application_command_id:
+        raise TypeError('application_command_id must be specified if application_command_name is specified')
 
     _channels = {c.id: c for c in channels} if channels else {}
 
@@ -321,6 +280,11 @@ async def _handle_message_search(
         before = Object(id=utils.time_snowflake(before, high=False))
     if isinstance(after, datetime):
         after = Object(id=utils.time_snowflake(after, high=True))
+
+    after = after or OLDEST_OBJECT
+    if oldest_first is MISSING:
+        oldest_first = after != OLDEST_OBJECT
+
     if (
         include_nsfw is MISSING
         and not isinstance(destination, Messageable)
@@ -331,12 +295,18 @@ async def _handle_message_search(
 
     if before:
         payload['max_id'] = before.id
-    if after:
+    if after != OLDEST_OBJECT:
         payload['min_id'] = after.id
+    if offset:
+        payload['offset'] = offset
     if include_nsfw is not MISSING:
         payload['include_nsfw'] = str(include_nsfw).lower()
     if content:
         payload['content'] = content
+    if contents:
+        payload['contents'] = list(contents)
+    if slop:
+        payload['slop'] = slop
     if channels:
         payload['channel_id'] = [c.id for c in channels]
     if authors:
@@ -361,23 +331,68 @@ async def _handle_message_search(
         payload['attachment_filename'] = list(attachment_filenames)
     if attachment_extensions:
         payload['attachment_extension'] = list(attachment_extensions)
-    if application_commands:
-        payload['command_id'] = [c.id for c in application_commands]
+    if application_command_id:
+        payload['command_id'] = application_command_id.id
+    if application_command_name:
+        payload['command_name'] = application_command_name
     if oldest_first:
         payload['sort_order'] = 'asc'
     if most_relevant:
+        # This is the default and it isn't respected anyway, but this ep is cursed enough as it is
+        # So we will go with what the client does
+        payload['sort_order'] = 'desc'
         payload['sort_by'] = 'relevance'
 
+    async def _state_strategy(retrieve: int, state: Optional[Snowflake], limit: Optional[int]):
+        payload['limit'] = retrieve
+        if oldest_first and state:
+            payload['min_id'] = state.id
+        elif state:
+            payload['max_id'] = state.id
+        data = await endpoint(entity_id, payload)
+
+        if data['messages']:
+            if limit is not None:
+                limit -= len(data['messages'])
+
+            state = Object(id=int(data['messages'][-1][0]['id']))
+
+        return data, state, limit
+
+    async def _relevance_strategy(retrieve: int, _, limit: Optional[int]):
+        payload['limit'] = retrieve
+        data = await endpoint(entity_id, payload)
+
+        if data['messages']:
+            length = len(data['messages'])
+            if limit is not None:
+                limit -= length
+            payload['offset'] = payload.get('offset', 0) + length
+
+        return data, None, limit
+
+    if most_relevant:
+        strategy, state = _relevance_strategy, None
+    elif oldest_first:
+        strategy, state = _state_strategy, after
+    else:
+        strategy, state = _state_strategy, before
+
+    total_results = MISSING
+    total = 0
+
     while True:
-        retrieve = min(25 if limit is None else limit, 25)
+        retrieve = 25 if limit is None else min(limit, 25)
         if retrieve < 1:
             return
-        if retrieve != 25:
-            payload['limit'] = retrieve
-        if offset:
-            payload['offset'] = offset
 
-        data = await endpoint(entity_id, payload)
+        data, state, limit = await strategy(retrieve, state, limit)
+
+        if total_results is MISSING:
+            total_results = data['total_results']
+
+        messages = data['messages']
+
         threads = {int(thread['id']): thread for thread in data.get('threads', [])}
         for member in data.get('members', []):
             thread_id = int(member['id'])
@@ -385,17 +400,11 @@ async def _handle_message_search(
             if thread:
                 thread['member'] = member
 
-        length = len(data['messages'])
-        offset += length
-        if limit is not None:
-            limit -= length
+        count = 0
 
-        # Terminate loop on next iteration; there's no data left after this
-        if len(data['messages']) < 25:
-            limit = 0
-
-        for raw_messages in data['messages']:
+        for count, raw_messages in enumerate(messages, 1):
             if not raw_messages:
+                _log.debug('Search for %s with payload %s yielded an empty subarray.', destination, payload)
                 continue
 
             # Context is no longer sent, so this is probably fine
@@ -406,6 +415,13 @@ async def _handle_message_search(
 
             channel = _resolve_channel(raw_message)
             yield _state.create_message(channel=channel, data=raw_message, search_result=data)  # type: ignore
+
+        if count == 0:
+            return
+
+        total += count
+        if total >= total_results:
+            return
 
 
 @runtime_checkable
@@ -485,6 +501,16 @@ class User(Snowflake, Protocol):
     @property
     def avatar_decoration_sku_id(self) -> Optional[int]:
         """Optional[:class:`int`]: Returns the SKU ID of the user's avatar decoration, if present.
+
+        .. versionadded:: 2.1
+        """
+        raise NotImplementedError
+
+    @property
+    def avatar_decoration_expires_at(self) -> Optional[datetime]:
+        """Optional[:class:`datetime.datetime`]: Returns the avatar decoration's expiration time.
+
+        If the user does not have an expiring avatar decoration, ``None`` is returned.
 
         .. versionadded:: 2.1
         """
@@ -613,8 +639,7 @@ class GuildChannel:
 
     if TYPE_CHECKING:
 
-        def __init__(self, *, state: ConnectionState, guild: Guild, data: GuildChannelPayload):
-            ...
+        def __init__(self, *, state: ConnectionState, guild: Guild, data: GuildChannelPayload): ...
 
     def __str__(self) -> str:
         return self.name
@@ -623,20 +648,44 @@ class GuildChannel:
     def _sorting_bucket(self) -> int:
         raise NotImplementedError
 
+    def _can_everyone(self, permission: flag_value) -> bool:
+        if self.permissions_for(self.guild.default_role).value & permission.flag != permission.flag:
+            return False
+        for overwrite in self._overwrites:
+            if overwrite.deny & permission.flag == permission.flag:
+                return False
+        return True
+
+    def _is_everyone_member_list(self) -> bool:
+        # This should use _can_everyone(Permissions.read_messages) but Discord's implementation is flawed
+        # so we must use the flawed implementation to be compatible
+        if not self.guild.default_role.permissions.read_messages:
+            return False
+        for overwrite in self._overwrites:
+            if overwrite.deny & Permissions.read_messages.flag == Permissions.read_messages.flag:
+                return False
+        return True
+
     @property
-    def member_list_id(self) -> Union[str, Literal["everyone"]]:
-        if self.permissions_for(self.guild.default_role).read_messages:
-            return "everyone"
+    def member_list_id(self) -> Union[str, Literal['everyone']]:
+        """:class:`str`: The ID of the member list for this channel.
+
+        A member list ID of ``everyone`` indicates that everyone can view the channel.
+
+        .. versionadded:: 2.1
+        """
+        if self._is_everyone_member_list():
+            return 'everyone'
 
         overwrites = []
         for overwrite in self._overwrites:
             allow, deny = Permissions(overwrite.allow), Permissions(overwrite.deny)
             if allow.read_messages:
-                overwrites.append(f"allow:{overwrite.id}")
+                overwrites.append(f'allow:{overwrite.id}')
             elif deny.read_messages:
-                overwrites.append(f"deny:{overwrite.id}")
+                overwrites.append(f'deny:{overwrite.id}')
 
-        return str(utils.murmurhash32(",".join(sorted(overwrites)), signed=False))
+        return str(utils.murmurhash32(','.join(sorted(overwrites)), signed=False))
 
     def _update(self, guild: Guild, data: Dict[str, Any]) -> None:
         raise NotImplementedError
@@ -1024,7 +1073,7 @@ class GuildChannel:
             if obj.is_default():
                 return base
 
-            overwrite = utils.get(self._overwrites, type=_Overwrites.ROLE, id=obj.id)
+            overwrite = utils.find(lambda ow: ow.type == _Overwrites.ROLE and ow.id == obj.id, self._overwrites)
             if overwrite is not None:
                 base.handle_overwrite(overwrite.allow, overwrite.deny)
 
@@ -1111,8 +1160,7 @@ class GuildChannel:
         *,
         overwrite: Optional[Union[PermissionOverwrite, _Undefined]] = ...,
         reason: Optional[str] = ...,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @overload
     async def set_permissions(
@@ -1120,9 +1168,8 @@ class GuildChannel:
         target: Union[Member, Role],
         *,
         reason: Optional[str] = ...,
-        **permissions: Optional[bool],
-    ) -> None:
-        ...
+        **permissions: Unpack[_PermissionOverwriteKwargs],
+    ) -> None: ...
 
     async def set_permissions(
         self,
@@ -1130,7 +1177,7 @@ class GuildChannel:
         *,
         overwrite: Any = _undefined,
         reason: Optional[str] = None,
-        **permissions: Optional[bool],
+        **permissions: Unpack[_PermissionOverwriteKwargs],
     ) -> None:
         r"""|coro|
 
@@ -1317,8 +1364,7 @@ class GuildChannel:
         category: Optional[Snowflake] = MISSING,
         sync_permissions: bool = MISSING,
         reason: Optional[str] = MISSING,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @overload
     async def move(
@@ -1329,8 +1375,7 @@ class GuildChannel:
         category: Optional[Snowflake] = MISSING,
         sync_permissions: bool = MISSING,
         reason: str = MISSING,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @overload
     async def move(
@@ -1341,8 +1386,7 @@ class GuildChannel:
         category: Optional[Snowflake] = MISSING,
         sync_permissions: bool = MISSING,
         reason: str = MISSING,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @overload
     async def move(
@@ -1353,8 +1397,7 @@ class GuildChannel:
         category: Optional[Snowflake] = MISSING,
         sync_permissions: bool = MISSING,
         reason: str = MISSING,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     async def move(self, **kwargs: Any) -> None:
         """|coro|
@@ -1473,11 +1516,11 @@ class GuildChannel:
             raise ValueError('Could not resolve appropriate move position')
 
         channels.insert(max((index + offset), 0), self)
-        payload = []
+        payload: List[ChannelPositionUpdate] = []
         lock_permissions = kwargs.get('sync_permissions', False)
         reason = kwargs.get('reason')
         for index, channel in enumerate(channels):
-            d = {'id': channel.id, 'position': index}
+            d: ChannelPositionUpdate = {'id': channel.id, 'position': index}
             if parent_id is not MISSING and channel.id == self.id:
                 d.update(parent_id=parent_id, lock_permissions=lock_permissions)
             payload.append(d)
@@ -1493,6 +1536,7 @@ class GuildChannel:
         temporary: bool = False,
         unique: bool = True,
         guest: bool = False,
+        application_bypass: bool = False,
         target_type: Optional[InviteTarget] = None,
         target_user: Optional[User] = None,
         target_application: Optional[Snowflake] = None,
@@ -1524,9 +1568,14 @@ class GuildChannel:
             Defaults to ``False``.
 
             .. versionadded:: 2.1
+        application_bypass: :class:`bool`
+            Denotes that the invite bypasses guild join requests and adds the user directly to the guild with :attr:`discord.Member.pending` set to ``False``.
+            Requires that manual approval is enabled for the guild.
+
+            .. versionadded:: 2.1
         unique: :class:`bool`
             Indicates if a unique invite URL should be created. Defaults to ``True``.
-            If this is set to ``False`` then it will return a previously created
+            If this is set to ``False`` then it may return a previously created
             invite.
         target_type: Optional[:class:`~discord.InviteTarget`]
             The type of target for the voice channel invite, if any.
@@ -1561,9 +1610,12 @@ class GuildChannel:
             raise ValueError('target_type parameter must be InviteTarget.stream, or InviteTarget.embedded_application')
         if target_type == InviteTarget.unknown:
             target_type = None
+
         flags = InviteFlags()
         if guest:
             flags.guest = True
+        if application_bypass:
+            flags.application_bypass = True
 
         data = await self._state.http.create_invite(
             self.id,
@@ -1684,8 +1736,7 @@ class Messageable:
         suppress_embeds: bool = ...,
         silent: bool = ...,
         poll: Poll = ...,
-    ) -> Message:
-        ...
+    ) -> Message: ...
 
     @overload
     async def send(
@@ -1703,8 +1754,7 @@ class Messageable:
         suppress_embeds: bool = ...,
         silent: bool = ...,
         poll: Poll = ...,
-    ) -> Message:
-        ...
+    ) -> Message: ...
 
     @overload
     async def send(
@@ -1722,8 +1772,7 @@ class Messageable:
         suppress_embeds: bool = ...,
         silent: bool = ...,
         poll: Poll = ...,
-    ) -> Message:
-        ...
+    ) -> Message: ...
 
     @overload
     async def send(
@@ -1741,8 +1790,7 @@ class Messageable:
         suppress_embeds: bool = ...,
         silent: bool = ...,
         poll: Poll = ...,
-    ) -> Message:
-        ...
+    ) -> Message: ...
 
     async def send(
         self,
@@ -1841,6 +1889,9 @@ class Messageable:
             Sending the message failed.
         ~discord.Forbidden
             You do not have the proper permissions to send the message.
+        ~discord.NotFound
+            You sent a message with the same nonce as one that has been explicitly
+            deleted shortly earlier.
         ValueError
             The ``files`` list is not of the appropriate size.
         TypeError
@@ -1994,6 +2045,10 @@ class Messageable:
         the destination for an indefinite period of time, or 10 seconds if the context manager
         is called using ``await``.
 
+        The returned context manager contains ``message_send_cooldown`` and ``thread_create_cooldown``
+        attributes that are integers representing the time left (in milliseconds) until the channel's
+        slowmode expires. These attributes are updated from every typing request sent to the API.
+
         Example Usage: ::
 
             async with channel.typing():
@@ -2013,6 +2068,9 @@ class Messageable:
 
         .. versionchanged:: 2.0
             Added functionality to ``await`` the context manager to send a typing indicator for 10 seconds.
+
+        .. versionchanged:: 2.1
+            Added ``message_send_cooldown`` and ``thread_create_cooldown`` attributes to the context manager.
         """
         return Typing(self)
 
@@ -2095,16 +2153,118 @@ class Messageable:
         channel = await self._get_channel()
         await self._state.http.ack_pins(channel.id)
 
-    async def pins(self) -> List[Message]:
-        """|coro|
+    async def __pins(
+        self,
+        *,
+        limit: Optional[int] = 50,
+        before: Optional[SnowflakeTime] = None,
+        oldest_first: bool = False,
+    ) -> AsyncIterator[PinnedMessage]:
+        channel = await self._get_channel()
+        state = self._state
+        max_limit: int = 50
 
-        Retrieves all messages that are currently pinned in the channel.
+        time: Optional[str] = (
+            (before if isinstance(before, datetime) else utils.snowflake_time(before.id)).isoformat()
+            if before is not None
+            else None
+        )
+
+        while True:
+            retrieve = max_limit if limit is None else min(limit, max_limit)
+            if retrieve < 1:
+                break
+
+            data = await self._state.http.pins_from(
+                channel_id=channel.id,
+                limit=retrieve,
+                before=time,
+            )
+
+            items = data and data['items']
+            if items:
+                if limit is not None:
+                    limit -= len(items)
+
+                time = items[-1]['pinned_at']
+
+            # Terminate loop on next iteration; there's no data left after this
+            if len(items) < max_limit or not data['has_more']:
+                limit = 0
+
+            if oldest_first:
+                items = reversed(items)
+
+            count = 0
+            for count, m in enumerate(items, start=1):
+                message: Message = state.create_message(channel=channel, data=m['message'])
+                message._pinned_at = utils.parse_time(m['pinned_at'])
+                yield message  # pyright: ignore[reportReturnType]
+
+            if count < max_limit:
+                break
+
+    def pins(
+        self,
+        *,
+        limit: Optional[int] = 50,
+        before: Optional[SnowflakeTime] = None,
+        oldest_first: bool = False,
+    ) -> _PinsIterator:
+        """Retrieves an :term:`asynchronous iterator` of the pinned messages in the channel.
+
+        You must have :attr:`~discord.Permissions.view_channel` and
+        :attr:`~discord.Permissions.read_message_history` in order to use this.
+
+        .. versionchanged:: 2.1
+
+            Due to a change in Discord's API, this now returns a paginated iterator instead of a list.
+
+            For backwards compatibility, you can still retrieve a list of pinned messages by
+            using ``await`` on the returned object. This is however deprecated.
 
         .. note::
 
             Due to a limitation with the Discord API, the :class:`.Message`
-            objects returned by this method do not contain complete
+            object returned by this method does not contain complete
             :attr:`.Message.reactions` data.
+
+        Examples
+        ---------
+
+        Usage ::
+
+            counter = 0
+            async for message in channel.pins(limit=250):
+                counter += 1
+
+        Flattening into a list: ::
+
+            messages = [message async for message in channel.pins(limit=50)]
+            # messages is now a list of Message...
+
+        All parameters are optional.
+
+        Parameters
+        -----------
+        limit: Optional[int]
+            The number of pinned messages to retrieve. If ``None``, it retrieves
+            every pinned message in the channel. Note, however, that this would
+            make it a slow operation.
+            Defaults to ``50``.
+
+            .. versionadded:: 2.1
+        before: Optional[Union[:class:`datetime.datetime`, :class:`.abc.Snowflake`]]
+            Retrieve pinned messages before this time or snowflake.
+            If a datetime is provided, it is recommended to use a UTC aware datetime.
+            If the datetime is naive, it is assumed to be local time.
+
+            .. versionadded:: 2.1
+        oldest_first: :class:`bool`
+            If set to ``True``, return messages in oldest pin->newest pin order.
+            Defaults to ``False``.
+
+            .. versionadded:: 2.1
 
         Raises
         -------
@@ -2113,15 +2273,12 @@ class Messageable:
         ~discord.HTTPException
             Retrieving the pinned messages failed.
 
-        Returns
-        --------
-        List[:class:`~discord.Message`]
-            The messages that are currently pinned.
+        Yields
+        -------
+        :class:`~discord.Message`
+            The pinned message with :attr:`.Message.pinned_at` set.
         """
-        channel = await self._get_channel()
-        state = self._state
-        data = await state.http.pins_from(channel.id)
-        return [state.create_message(channel=channel, data=m) for m in data]
+        return _PinsIterator(self.__pins(limit=limit, before=before, oldest_first=oldest_first))
 
     async def history(
         self,
@@ -2242,7 +2399,7 @@ class Messageable:
             if limit is None:
                 raise ValueError('history does not support around with limit=None')
             if limit > 101:
-                raise ValueError("history max limit 101 when specifying around parameter")
+                raise ValueError('history max limit 101 when specifying around parameter')
 
             # Strange Discord quirk
             limit = 100 if limit == 101 else limit
@@ -2291,6 +2448,8 @@ class Messageable:
         self,
         content: str = MISSING,
         *,
+        contents: Sequence[str] = MISSING,
+        slop: int = MISSING,
         limit: Optional[int] = 25,
         offset: int = 0,
         before: SnowflakeTime = MISSING,
@@ -2306,8 +2465,9 @@ class Messageable:
         link_hostnames: Collection[str] = MISSING,
         attachment_filenames: Collection[str] = MISSING,
         attachment_extensions: Collection[str] = MISSING,
-        application_commands: Collection[Snowflake] = MISSING,
-        oldest_first: bool = False,
+        application_command_id: Snowflake = MISSING,
+        application_command_name: str = MISSING,
+        oldest_first: bool = MISSING,
         most_relevant: bool = False,
     ) -> AsyncIterator[Message]:
         """Returns an :term:`asynchronous iterator` that enables searching the channel's messages.
@@ -2343,12 +2503,14 @@ class Messageable:
         -----------
         content: :class:`str`
             The message content to search for.
+        contents: List[:class:`str`]
+            Tokenized message contents to search for. Must be prefixed with ``0|`` for exact match or ``2|`` for fuzzy match.
+        slop: :class:`int`
+            The slop for message content token matching from 0 to 100. Defaults to 2.
         limit: Optional[:class:`int`]
             The number of messages to retrieve.
             If ``None``, retrieves every message in the results. Note, however,
-            that this would make it a slow operation. Additionally, note that the
-            search API has a maximum pagination offset of 5000 (subject to change),
-            so a limit of over 5000 or ``None`` may eventually raise an exception.
+            that this would make it a slow operation.
         offset: :class:`int`
             The pagination offset to start at.
         before: Union[:class:`~discord.abc.Snowflake`, :class:`datetime.datetime`]
@@ -2384,22 +2546,25 @@ class Messageable:
             The attachment filenames to filter by.
         attachment_extensions: List[:class:`str`]
             The attachment extensions to filter by (e.g. txt).
-        application_commands: List[:class:`~discord.abc.ApplicationCommand`]
-            The used application commands to filter by.
+        application_command_id: :class:`int`
+            The application command ID to filter by. Must be used with ``application_command_name``.
+        application_command_name: :class:`str`
+            The application command name to filter by. Must be used with ``application_command_id``.
         oldest_first: :class:`bool`
-            Whether to return the oldest results first.
+            Whether to return the oldest results first. Defaults to ``True`` if
+            ``after`` is specified, otherwise ``False``. Ignored when ``most_relevant`` is set.
         most_relevant: :class:`bool`
-            Whether to sort the results by relevance. Using this with ``oldest_first``
-            will return the least relevant results first.
+            Whether to sort the results by relevance. Limits pagination to 10,000 entries.
 
         Raises
         ------
-        ~discord.Forbidden
-            You do not have permissions to search the channel's messages.
         ~discord.HTTPException
             The request to search messages failed.
+        TypeError
+            Provided both ``before`` and ``after`` when ``most_relevant`` is set.
         ValueError
             Could not resolve the channel's guild ID.
+            Did not provide both ``application_command_id`` and ``application_command_name``.
 
         Yields
         -------
@@ -2413,6 +2578,8 @@ class Messageable:
             before=before,
             after=after,
             content=content,
+            contents=contents,
+            slop=slop,
             authors=authors,
             author_types=author_types,
             mentions=mentions,
@@ -2424,17 +2591,29 @@ class Messageable:
             link_hostnames=link_hostnames,
             attachment_filenames=attachment_filenames,
             attachment_extensions=attachment_extensions,
-            application_commands=application_commands,
+            application_command_id=application_command_id,
+            application_command_name=application_command_name,
             oldest_first=oldest_first,
             most_relevant=most_relevant,
         )
 
-    async def application_commands(self) -> List[Union[SlashCommand, UserCommand, MessageCommand]]:
+    async def application_commands(
+        self,
+    ) -> List[Union[SlashCommand, UserCommand, MessageCommand, PrimaryEntryPointCommand]]:
         """|coro|
 
         Returns a list of application commands available in the channel.
 
         .. versionadded:: 2.1
+
+        .. versionchanged:: 2.2
+
+            Returns an empty list instead of erroring for channels that cannot have commands.
+
+        .. note::
+
+            This endpoint is heavily rate limited. The application command index should be cached
+            and only refetched if necessary.
 
         .. note::
 
@@ -2442,8 +2621,6 @@ class Messageable:
 
         Raises
         ------
-        TypeError
-            Attempted to fetch commands in a DM with a non-bot user.
         ValueError
             Could not resolve the channel's guild ID.
         ~discord.HTTPException
@@ -2451,182 +2628,34 @@ class Messageable:
 
         Returns
         -------
-        List[Union[:class:`~discord.SlashCommand`, :class:`~discord.UserCommand`, :class:`~discord.MessageCommand`]]
+        List[Union[:class:`~discord.SlashCommand`, :class:`~discord.UserCommand`, :class:`~discord.MessageCommand`, :class:`~discord.PrimaryEntryPointCommand`]]
             A list of application commands.
         """
         channel = await self._get_channel()
         state = self._state
+        guild = None
         if channel.type is ChannelType.private:
             if not channel.recipient.bot:  # type: ignore
-                raise TypeError('Cannot fetch commands in a DM with a non-bot user')
+                return []
 
             data = await state.http.channel_application_command_index(channel.id)
         elif channel.type is ChannelType.group:
-            # TODO: Are commands in group DMs truly dead?
             return []
         else:
-            guild_id = getattr(channel.guild, 'id', getattr(channel, 'guild_id', None))
+            guild = channel.guild
+            if guild is not None:
+                guild_id = guild.id
+            else:
+                from .channel import PartialMessageable
+
+                if not isinstance(channel, PartialMessageable) or channel.guild_id is None:
+                    raise ValueError('Could not resolve channel guild ID') from None
+                guild_id = channel.guild_id
             if not guild_id:
                 raise ValueError('Could not resolve channel guild ID') from None
             data = await state.http.guild_application_command_index(guild_id)
 
-        cmds = data['application_commands']
-        apps = {int(app['id']): state.create_integration_application(app) for app in data.get('applications') or []}
-
-        result = []
-        for cmd in cmds:
-            _, cls = _command_factory(cmd['type'])
-            application = apps.get(int(cmd['application_id']))
-            result.append(cls(state=state, data=cmd, channel=channel, application=application))
-        return result
-
-    @utils.deprecated('Messageable.application_commands')
-    def slash_commands(
-        self,
-        query: Optional[str] = None,
-        *,
-        limit: Optional[int] = None,
-        command_ids: Optional[Collection[int]] = None,
-        application: Optional[Snowflake] = None,
-        with_applications: bool = True,
-    ) -> AsyncIterator[SlashCommand]:
-        """Returns a :term:`asynchronous iterator` of the slash commands available in the channel.
-
-        .. deprecated:: 2.1
-
-        Examples
-        ---------
-
-        Usage ::
-
-            async for command in channel.slash_commands():
-                print(command.name)
-
-        Flattening into a list ::
-
-            commands = [command async for command in channel.slash_commands()]
-            # commands is now a list of SlashCommand...
-
-        All parameters are optional.
-
-        Parameters
-        ----------
-        query: Optional[:class:`str`]
-            The query to search for. Specifying this limits results to 25 commands max.
-        limit: Optional[:class:`int`]
-            The maximum number of commands to send back. If ``None``, returns all commands.
-        command_ids: Optional[List[:class:`int`]]
-            List of up to 100 command IDs to search for. If the command doesn't exist, it won't be returned.
-
-            If ``limit`` is passed alongside this parameter, this parameter will serve as a "preferred commands" list.
-            This means that the endpoint will return the found commands + up to ``limit`` more, if available.
-        application: Optional[:class:`~discord.abc.Snowflake`]
-            Whether to return this application's commands. Always set to DM recipient in a private channel context.
-        with_applications: :class:`bool`
-            Whether to include applications in the response.
-
-        Raises
-        ------
-        TypeError
-            Both query and command_ids are passed.
-            Attempted to fetch commands in a DM with a non-bot user.
-        ValueError
-            The limit was not greater than or equal to 0.
-            Could not resolve the channel's guild ID.
-        ~discord.HTTPException
-            Getting the commands failed.
-        ~discord.Forbidden
-            You do not have permissions to get the commands.
-        ~discord.HTTPException
-            The request to get the commands failed.
-
-        Yields
-        -------
-        :class:`~discord.SlashCommand`
-            A slash command.
-        """
-        return _handle_commands(
-            self,
-            ApplicationCommandType.chat_input,
-            query=query,
-            limit=limit,
-            command_ids=command_ids,
-            application=application,
-        )
-
-    @utils.deprecated('Messageable.application_commands')
-    def user_commands(
-        self,
-        query: Optional[str] = None,
-        *,
-        limit: Optional[int] = None,
-        command_ids: Optional[Collection[int]] = None,
-        application: Optional[Snowflake] = None,
-        with_applications: bool = True,
-    ) -> AsyncIterator[UserCommand]:
-        """Returns a :term:`asynchronous iterator` of the user commands available to use on the user.
-
-        .. deprecated:: 2.1
-
-        Examples
-        ---------
-
-        Usage ::
-
-            async for command in user.user_commands():
-                print(command.name)
-
-        Flattening into a list ::
-
-            commands = [command async for command in user.user_commands()]
-            # commands is now a list of UserCommand...
-
-        All parameters are optional.
-
-        Parameters
-        ----------
-        query: Optional[:class:`str`]
-            The query to search for. Specifying this limits results to 25 commands max.
-        limit: Optional[:class:`int`]
-            The maximum number of commands to send back. If ``None``, returns all commands.
-        command_ids: Optional[List[:class:`int`]]
-            List of up to 100 command IDs to search for. If the command doesn't exist, it won't be returned.
-
-            If ``limit`` is passed alongside this parameter, this parameter will serve as a "preferred commands" list.
-            This means that the endpoint will return the found commands + up to ``limit`` more, if available.
-        application: Optional[:class:`~discord.abc.Snowflake`]
-            Whether to return this application's commands. Always set to DM recipient in a private channel context.
-        with_applications: :class:`bool`
-            Whether to include applications in the response.
-
-        Raises
-        ------
-        TypeError
-            Both query and command_ids are passed.
-            Attempted to fetch commands in a DM with a non-bot user.
-        ValueError
-            The limit was not greater than or equal to 0.
-            Could not resolve the channel's guild ID.
-        ~discord.HTTPException
-            Getting the commands failed.
-        ~discord.Forbidden
-            You do not have permissions to get the commands.
-        ~discord.HTTPException
-            The request to get the commands failed.
-
-        Yields
-        -------
-        :class:`~discord.UserCommand`
-            A user command.
-        """
-        return _handle_commands(
-            self,
-            ApplicationCommandType.user,
-            query=query,
-            limit=limit,
-            command_ids=command_ids,
-            application=application,
-        )
+        return _commands_from_index(state=state, data=data, channel=channel, guild=guild)
 
 
 class Connectable(Protocol):
@@ -2664,6 +2693,7 @@ class Connectable(Protocol):
         _channel: Optional[Connectable] = None,
         self_deaf: bool = False,
         self_mute: bool = False,
+        self_video: bool = False,
     ) -> T:
         """|coro|
 
@@ -2689,6 +2719,10 @@ class Connectable(Protocol):
             Indicates if the client should be self-deafened.
 
             .. versionadded:: 2.0
+        self_video: :class:`bool`
+            Indicates if the client should join with video enabled.
+
+            .. versionadded:: 2.2
 
         Raises
         -------
@@ -2710,7 +2744,7 @@ class Connectable(Protocol):
         connectable = _channel or self
         channel = await connectable._get_channel()
 
-        if state._get_voice_client(key_id):
+        if state._has_voice_client():
             raise ClientException('Already connected to a voice channel')
 
         voice: T = cls(state.client, channel)
@@ -2721,7 +2755,13 @@ class Connectable(Protocol):
         state._add_voice_client(key_id, voice)
 
         try:
-            await voice.connect(timeout=timeout, reconnect=reconnect, self_deaf=self_deaf, self_mute=self_mute)
+            await voice.connect(
+                timeout=timeout,
+                reconnect=reconnect,
+                self_deaf=self_deaf,
+                self_mute=self_mute,
+                self_video=self_video,
+            )
         except asyncio.TimeoutError:
             try:
                 await voice.disconnect(force=True)

@@ -39,6 +39,7 @@ from .enums import (
 )
 from .metadata import Metadata
 from .mixins import Hashable
+from .store import SKUPrice
 from .utils import MISSING, _get_as_snowflake, parse_time, snowflake_time, utcnow
 
 if TYPE_CHECKING:
@@ -185,6 +186,10 @@ class SubscriptionInvoiceItem(Hashable):
 
     .. versionadded:: 2.0
 
+    .. versionchanged:: 2.1
+
+        Made :attr:`plan_id` and :attr:`plan_price` optional.
+
     Attributes
     ----------
     id: :class:`int`
@@ -195,29 +200,46 @@ class SubscriptionInvoiceItem(Hashable):
         The price of the item. This includes discounts.
     proration: :class:`bool`
         Whether the item is prorated.
-    plan_id: :class:`int`
+    plan_id: Optional[:class:`int`]
         The ID of the subscription plan the item represents.
-    plan_price: :class:`int`
+    plan_price: Optional[:class:`int`]
         The price of the subscription plan the item represents. This does not include discounts.
+    unit_price: Optional[:class:`int`]
+        The unit price of the item, if applicable.
+
+        .. versionadded:: 2.1
     discounts: List[:class:`SubscriptionDiscount`]
         A list of discounts applied to the item.
-    metadata: :class:`Metadata`
-        Extra metadata about the invoice item.
+    tenant_metadata: :class:`Metadata`
+        Tenant metadata for the invoice item.
 
         .. versionadded:: 2.1
     """
 
-    __slots__ = ('id', 'quantity', 'amount', 'proration', 'plan_id', 'plan_price', 'discounts', 'metadata')
+    __slots__ = (
+        'id',
+        'quantity',
+        'amount',
+        'proration',
+        'sku_id',
+        'plan_id',
+        'plan_price',
+        'unit_price',
+        'discounts',
+        'tenant_metadata',
+    )
 
     def __init__(self, data: SubscriptionInvoiceItemPayload) -> None:
         self.id: int = int(data['id'])
         self.quantity: int = data['quantity']
         self.amount: int = data['amount']
         self.proration: bool = data.get('proration', False)
-        self.plan_id: int = int(data['subscription_plan_id'])
-        self.plan_price: int = data['subscription_plan_price']
+        self.sku_id: Optional[int] = _get_as_snowflake(data, 'sku_id')  # Seems to always be null
+        self.plan_id: Optional[int] = _get_as_snowflake(data, 'subscription_plan_id')
+        self.plan_price: Optional[int] = data.get('subscription_plan_price')
+        self.unit_price: Optional[SKUPrice] = SKUPrice(data['unit_price']) if data.get('unit_price') else None  # type: ignore
         self.discounts: List[SubscriptionDiscount] = [SubscriptionDiscount(d) for d in data['discounts']]
-        self.metadata: Metadata = Metadata(data.get('tenant_metadata', {}))
+        self.tenant_metadata: Metadata = Metadata(data.get('tenant_metadata', {}))
 
     def __repr__(self) -> str:
         return f'<SubscriptionInvoiceItem id={self.id} quantity={self.quantity} amount={self.amount}>'
@@ -228,7 +250,11 @@ class SubscriptionInvoiceItem(Hashable):
     @property
     def savings(self) -> int:
         """:class:`int`: The total amount of discounts on the invoice item."""
-        return self.plan_price - self.amount
+        if self.plan_price is not None:
+            return self.plan_price - self.amount
+        if self.unit_price is not None:
+            return self.unit_price.amount - self.amount
+        return 0
 
     def is_discounted(self) -> bool:
         """:class:`bool`: Indicates if the invoice item has a discount."""
@@ -258,6 +284,10 @@ class SubscriptionInvoice(Hashable):
 
     .. versionadded:: 2.0
 
+    .. versionchanged:: 2.1
+
+        Made ``current_period_start`` and ``current_period_end`` optional.
+
     Attributes
     ----------
     subscription: Optional[:class:`Subscription`]
@@ -278,12 +308,16 @@ class SubscriptionInvoice(Hashable):
         Whether the subtotal is inclusive of all taxes.
     items: List[:class:`SubscriptionInvoiceItem`]
         The items in the invoice.
-    current_period_start: :class:`datetime.datetime`
+    current_period_start: Optional[:class:`datetime.datetime`]
         When the current billing period started.
-    current_period_end: :class:`datetime.datetime`
+    current_period_end: Optional[:class:`datetime.datetime`]
         When the current billing period ends.
     applied_discount_ids: List[:class:`int`]
         The IDs of the discounts applied to the invoice.
+
+        .. versionadded:: 2.1
+    applied_user_discounts: Dict[:class:`int`, Optional[:class:`datetime.datetime`]]
+        The user discounts applied to the invoice and their expiration dates.
 
         .. versionadded:: 2.1
     """
@@ -323,14 +357,11 @@ class SubscriptionInvoice(Hashable):
         self.total: int = data['total']
         self.tax_inclusive: bool = data['tax_inclusive']
         self.items: List[SubscriptionInvoiceItem] = [SubscriptionInvoiceItem(d) for d in data.get('invoice_items', [])]
-
-        self.current_period_start: datetime = parse_time(data['subscription_period_start'])  # type: ignore # Should always be a datetime
-        self.current_period_end: datetime = parse_time(data['subscription_period_end'])  # type: ignore # Should always be a datetime
-
-        # These fields are unknown
-        self.applied_discount_ids: List[int] = [int(id) for id in data.get('applied_discount_ids', [])]
-        self.applied_user_discounts: Dict[int, Optional[Any]] = {
-            int(k): v for k, v in data.get('applied_user_discounts', {}).items()
+        self.current_period_start: Optional[datetime] = parse_time(data.get('subscription_period_start'))
+        self.current_period_end: Optional[datetime] = parse_time(data.get('subscription_period_end'))
+        self.applied_discount_ids: List[int] = [int(d_id) for d_id in data.get('applied_discount_ids', [])]
+        self.applied_user_discounts: Dict[int, Optional[datetime]] = {
+            int(d_id): parse_time(d) for d_id, d in data.get('applied_user_discounts', {}).items()
         }
 
     def __repr__(self) -> str:
@@ -342,7 +373,7 @@ class SubscriptionInvoice(Hashable):
 
     def is_preview(self) -> bool:
         """:class:`bool`: Indicates if the invoice is a preview and not real."""
-        return self.subscription is None or self.status is None
+        return self.status is None
 
     async def pay(
         self,
@@ -489,6 +520,14 @@ class Subscription(Hashable):
         The mutations to the subscription that will occur after renewal.
     trial_id: Optional[:class:`int`]
         The ID of the trial the subscription is from, if applicable.
+    discount_id: Optional[:class:`int`]
+        The ID of the discount the subscription has active.
+
+        .. versionadded:: 2.1
+    discount_expires_at: Optional[:class:`datetime.datetime`]
+        When the discount expires, if applicable.
+
+        .. versionadded:: 2.1
     payment_source_id: Optional[:class:`int`]
         The ID of the payment source the subscription is paid with, if applicable.
     payment_gateway_plan_id: Optional[:class:`str`]
@@ -546,9 +585,11 @@ class Subscription(Hashable):
         'current_period_end',
         'trial_ends_at',
         'streak_started_at',
-        'ended_at',
         'use_storekit_resubscribe',
         'metadata',
+        'ended_at',
+        'discount_id',
+        'discount_expires_at',
         'latest_invoice',
     )
 
@@ -569,7 +610,7 @@ class Subscription(Hashable):
         self.id: int = int(data['id'])
         self.type: SubscriptionType = try_enum(SubscriptionType, data['type'])
         self.status: Optional[SubscriptionStatus] = (
-            try_enum(SubscriptionStatus, data['status']) if 'status' in data else None  # type: ignore # ???
+            try_enum(SubscriptionStatus, data['status']) if 'status' in data else None
         )
         self.payment_gateway: Optional[PaymentGateway] = (
             try_enum(PaymentGateway, data['payment_gateway']) if 'payment_gateway' in data else None
@@ -596,12 +637,15 @@ class Subscription(Hashable):
         self.streak_started_at: Optional[datetime] = parse_time(data.get('streak_started_at'))
         self.use_storekit_resubscribe: bool = data.get('use_storekit_resubscribe', False)
 
+        # Some metadata is exposed; I don't love this implementation
         metadata = data.get('metadata') or {}
-        self.ended_at: Optional[datetime] = parse_time(metadata.get('ended_at', None))
         self.metadata: Metadata = Metadata(metadata)
+        self.ended_at: Optional[datetime] = parse_time(metadata.get('ended_at', None))
+        self.discount_id = _get_as_snowflake(metadata, 'active_discount_id')
+        self.discount_expires_at = parse_time(metadata.get('active_discount_expires_at', None))
 
         self.latest_invoice: Optional[SubscriptionInvoice] = (
-            SubscriptionInvoice(self, data=data['latest_invoice'], state=self._state) if 'latest_invoice' in data else None  # type: ignore # ???
+            SubscriptionInvoice(self, data=data['latest_invoice'], state=self._state) if 'latest_invoice' in data else None
         )
 
     @property
@@ -616,22 +660,35 @@ class Subscription(Hashable):
     @property
     def guild(self) -> Optional[Guild]:
         """Optional[:class:`Guild`]: The guild the subscription's entitlements apply to, if applicable."""
-        return self._state._get_guild(self.metadata.guild_id)
+        # I think guild_id is deprecated
+        return self._state._get_guild(self.metadata.guild_id or self.metadata.application_subscription_guild_id)
 
     @property
-    def grace_period(self) -> timedelta:
-        """:class:`datetime.timedelta`: How many days past the renewal date the user has available to pay outstanding invoices.
+    def grace_period(self) -> Optional[timedelta]:
+        """Optional[:class:`datetime.timedelta`]: How many days past the renewal date the user has available to pay outstanding invoices.
 
         .. note::
 
-            This is a static value and does not change based on the subscription's status.
-            For that, see :attr:`remaining`.
+            This is only available for past-due subscriptions.
 
         .. versionchanged:: 2.1
 
-            This is now a :class:`datetime.timedelta` instead of an :class:`int`.
+            This is now a Optional[:class:`datetime.timedelta`] instead of an :class:`int`.
         """
-        return timedelta(days=7 if self.payment_source_id else 3)
+        if self.grace_period_expires_at:
+            return self.grace_period_expires_at - utcnow()
+
+    @property
+    def grace_period_expires_at(self) -> Optional[datetime]:
+        """Optional[:class:`datetime.datetime`]: When the grace period expires.
+
+        .. versionadded:: 2.1
+        """
+        if self.payment_gateway == PaymentGateway.apple:
+            return self.metadata.apple_grace_period_expires_date or self.metadata.grace_period_expires_date
+        if self.payment_gateway == PaymentGateway.google:
+            return self.metadata.google_grace_period_expires_date or self.metadata.grace_period_expires_date
+        return self.metadata.grace_period_expires_date
 
     @property
     def remaining(self) -> timedelta:
@@ -639,12 +696,14 @@ class Subscription(Hashable):
         if self.status in (SubscriptionStatus.active, SubscriptionStatus.cancelled):
             return self.current_period_end - utcnow()
         elif self.status == SubscriptionStatus.past_due:
-            if self.payment_gateway == PaymentGateway.google and self.metadata.google_grace_period_expires_date:
-                return self.metadata.google_grace_period_expires_date - utcnow()
-            return (self.current_period_start + self.grace_period) - utcnow()
+            # Grace expiry is now always provided
+            return self.grace_period_expires_at - utcnow()  # type: ignore
         elif self.status == SubscriptionStatus.account_hold:
             # Max hold time is 30 days
             return (self.current_period_start + timedelta(days=30)) - utcnow()
+        elif self.status == SubscriptionStatus.billing_retry:
+            # Max retry time is 7 days
+            return (self.current_period_start + timedelta(days=7)) - utcnow()
         return timedelta()
 
     @property
@@ -656,6 +715,16 @@ class Subscription(Hashable):
             # Infinite trial?
             return self.remaining
         return self.trial_ends_at - utcnow()
+
+    @property
+    def discount_remaining(self) -> timedelta:
+        """:class:`datetime.timedelta`: The remaining time until the active discount on the subscription ends."""
+        if not self.discount_id:
+            return timedelta()
+        if not self.discount_expires_at:
+            # Infinite discount?
+            return self.remaining
+        return self.discount_expires_at - utcnow()
 
     def is_active(self) -> bool:
         """:class:`bool`: Indicates if the subscription is currently active and providing perks."""
@@ -750,6 +819,7 @@ class Subscription(Hashable):
         currency: str = MISSING,
         apply_entitlements: bool = MISSING,
         renewal: bool = MISSING,
+        discount_offer: Snowflake = MISSING,
     ) -> SubscriptionInvoice:
         """|coro|
 
@@ -769,6 +839,8 @@ class Subscription(Hashable):
             Whether to apply entitlements (credits) to the previewed invoice.
         renewal: :class:`bool`
             Whether the previewed invoice should be a renewal.
+        discount_offer: :class:`.DiscountOffer`
+            The discount offer to apply to the previewed invoice.
 
         Raises
         ------
@@ -791,6 +863,8 @@ class Subscription(Hashable):
             payload['apply_entitlements'] = apply_entitlements
         if renewal is not MISSING:
             payload['renewal'] = renewal
+        if discount_offer is not MISSING:
+            payload['user_discount_offer_id'] = discount_offer.id
 
         if payload:
             data = await self._state.http.preview_subscription_update(self.id, **payload)
@@ -871,6 +945,8 @@ class SubscriptionTrial(Hashable):
         The interval of the trial.
     interval_count: :class:`int`
         How many counts of the interval the trial provides.
+    sku_id: :class:`int`
+        The ID of the SKU the trial is for.
     """
 
     __slots__ = ('id', 'interval', 'interval_count', 'sku_id')

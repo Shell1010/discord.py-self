@@ -127,6 +127,7 @@ class ThreadChannel(_BaseChannel):
     rate_limit_per_user: int
     message_count: int
     member_count: int
+    total_message_sent: int
     thread_metadata: ThreadMetadata
     member: NotRequired[ThreadMember]
     owner_id: NotRequired[Snowflake]
@@ -191,12 +192,21 @@ class DMChannel(_BaseChannel):
     is_spam: NotRequired[bool]
 
 
+class GroupDMNickname(TypedDict):
+    id: Snowflake
+    nick: str
+
+
 class GroupDMChannel(_BaseChannel):
     type: Literal[3]
     name: Optional[str]
     icon: Optional[str]
     owner_id: Snowflake
+    application_id: NotRequired[Snowflake]
+    managed: NotRequired[bool]
+    nicks: NotRequired[List[GroupDMNickname]]
     recipients: List[PartialUser]
+    origin_channel_id: NotRequired[Snowflake]  # Only present in CHANNEL_CREATE
 
 
 Channel = Union[GuildChannel, DMChannel, GroupDMChannel]
